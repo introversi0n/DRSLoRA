@@ -20,6 +20,7 @@
 from .adaption_prompt import AdaptionPromptConfig, AdaptionPromptModel
 from .lora import LoraConfig, LoraModel
 from .msplora import MSPLoraConfig, MSPLoraModel
+from .drslora import DRSLoraConfig, DRSLoraModel
 from .ia3 import IA3Config, IA3Model
 from .adalora import AdaLoraConfig, AdaLoraModel
 from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparameterizationType
@@ -32,4 +33,5 @@ TUNERS_MAPPING = {
     "MSPLORA": MSPLoraModel,
     "IA3": IA3Model,
     "ADALORA": AdaLoraModel,
+    "DRSLORA": DRSLoraModel,
 }

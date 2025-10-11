@@ -32,6 +32,8 @@ from .peft_model import (
 from .tuners import (
     AdaLoraConfig,
     AdaLoraModel,
+    DRSLoraConfig,
+    DRSLoraModel,
     AdaptionPromptConfig,
     IA3Config,
     IA3Model,
@@ -67,6 +69,7 @@ PEFT_TYPE_TO_CONFIG_MAPPING = {
     "MSPLORA": MSPLoraConfig,
     "LORA": LoraConfig,
     "ADALORA": AdaLoraConfig,
+    "DRSLORA": DRSLoraConfig,
     "IA3": IA3Config,
 }
 
@@ -74,6 +77,7 @@ PEFT_TYPE_TO_TUNER_MAPPING = {
     "LORA": LoraModel,
     "MSPLORA": MSPLoraModel,
     "ADALORA": AdaLoraModel,
+    "DRSLORA": DRSLoraModel,
     "IA3": IA3Model,
 }
 
