@@ -1,16 +1,13 @@
-# MSPLoRA
-MSPLoRA is a parameter-efficient fine-tuning framework that decouples global, mid-level, and fine-grained information via a multi-scale pyramid of LoRA modules, achieving higher adaptability with fewer parameters.
-## Method Overview
-<div align=center> 
-<img src="./figs/method.png">
-</div> 
+# DRSLORA
+DRSLoRA by Yuhai Yang.
 
+## Method Overview
 ## Quickstart
 1. Install dependencies
 
    ```bash
-   conda create -n MSPLoRA python=3.10
-   conda activate MSPLoRA
+   conda create -n DRSLoRA python=3.10
+   conda activate DRSLoRA
    pip install torch==2.0.1
    pip install -r requirements.txt
    ```
@@ -36,4 +33,5 @@ bash glue_finetune.sh
 ```
 ## Thanks
 
-Code is largely based on [AGI-Edgerunners/LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters), [huggingface/peft](https://github.com/huggingface/peft), [huggingface/transformers](https://github.com/huggingface/transformers)
+Code is largely based on [AGI-Edgerunners/LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters), [huggingface/peft](https://github.com/huggingface/peft), [huggingface/transformers](https://github.com/huggingface/transformers), [
+Oblivioniss/MSPLoRA](https://github.com/Oblivioniss/MSPLoRA)
