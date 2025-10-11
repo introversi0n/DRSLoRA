@@ -1,8 +1,8 @@
 #!/bin/bash
 export WANDB_MODE=offline
 export HF_ENDPOINT=https://hf-mirror.com
-export HF_HOME=~/autodl-tmp # autoDL
-# export HF_HOME=./data # yours
+# export HF_HOME=~/autodl-tmp # autoDL
+export HF_HOME=./data # yours
 gpu=0
 
 run(){

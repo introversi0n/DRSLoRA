@@ -702,6 +702,8 @@ class RankAllocator(object):
         self.target_bgt = self.peft_config.target_r * len(self.name_set)
 
     def budget_schedule(self, step: int):
+        clamp_ind = False
+        mask_value=0
         tinit = self.peft_config.tinit
         tfinal = self.peft_config.tfinal
         total_step = self.peft_config.total_step
@@ -714,11 +716,17 @@ class RankAllocator(object):
             budget = self.target_bgt
             mask_ind = True
         else:
-            # Budget decreasing with a cubic scheduler
-            mul_coeff = 1 - (step - tinit) / (total_step - tfinal - tinit)
-            budget = int((self.init_bgt - self.target_bgt) * (mul_coeff**3) + self.target_bgt)
-            mask_ind = True if step % self.peft_config.deltaT == 0 else False
-        return budget, mask_ind
+            # AdaLora code delete
+            # # Budget decreasing with a cubic scheduler
+            # mul_coeff = 1 - (step - tinit) / (total_step - tfinal - tinit)
+            # budget = int((self.init_bgt - self.target_bgt) * (mul_coeff**3) + self.target_bgt)
+            # mask_ind = True if step % self.peft_config.deltaT == 0 else False
+
+            # DRSLora
+            budget = self.target_bgt
+            mask_ind = True if step == total_step - tfinal else False
+            clamp_ind = True
+        return budget, mask_ind, clamp_ind
 
     def update_ipt(self, model):
         # Update the sensitivity and uncertainty for every weight
@@ -745,10 +753,11 @@ class RankAllocator(object):
         sum_ipt = ipt_E.view(-1) + ipt_AB.view(-1)
         return sum_ipt
 
-    def mask_to_budget(self, model, budget):
+    def mask_to_budget(self, model, curr_rank):
         value_ipt = {}
         vector_ipt = {}
         triplet_ipt = {}
+        lora_E_is = []
         # Get the importance score for A, E, B
         for n, p in model.named_parameters():
             if f"lora_A.{self.adapter_name}" in n:
@@ -771,6 +780,7 @@ class RankAllocator(object):
                 entry_ipt = self._element_score(n)
                 name_m = n.replace("lora_E", "%s")
                 value_ipt[name_m] = entry_ipt
+                lora_E_is.append(p.view(-1).abs().detach().clone())
 
         all_score = []
         # Calculate the score for each triplet
@@ -782,18 +792,23 @@ class RankAllocator(object):
             triplet_ipt[name_E] = sum_ipt.view(-1, 1)
             all_score.append(sum_ipt.view(-1))
 
-        # Get the threshold by ranking ipt
-        mask_threshold = torch.kthvalue(
-            torch.cat(all_score),
-            k=self.init_bgt - budget,
-        )[0].item()
+        # AdaLora delete
+        # # Get the threshold by ranking ipt
+        # mask_threshold = torch.kthvalue(
+        #     torch.cat(all_score),
+        #     k=self.init_bgt - budget,
+        # )[0].item()
 
+        mask_threshold = torch.kthvalue(torch.cat(lora_E_is), (self.total_rank - curr_rank))[0].item()
         rank_pattern = {}
         # Mask the unimportant triplets
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if f"lora_E.{self.adapter_name}" in n:
-                    p.masked_fill_(triplet_ipt[n] <= mask_threshold, 0.0)
+                    # Adalora delete
+                    # p.masked_fill_(triplet_ipt[n] <= mask_threshold, 0.0)
+                    # DRSLora
+                    p.data.masked_fill_(p.data <= mask_threshold, 0.0)
                     rank_pattern[n] = (~(triplet_ipt[n] <= mask_threshold)).view(-1).tolist()
         return rank_pattern
 
@@ -801,13 +816,42 @@ class RankAllocator(object):
         # # Update the importance score and allocate the budget
         if global_step < self.peft_config.total_step - self.peft_config.tfinal:
             self.update_ipt(model)
-        budget, mask_ind = self.budget_schedule(global_step)
+        budget, mask_ind, clamp_ind = self.budget_schedule(global_step)
         # Allocate the budget according to importance scores
         if mask_ind or force_mask:
             rank_pattern = self.mask_to_budget(model, budget)
         else:
             rank_pattern = None
+        # clamp to control lora_E
+        # TODO:hard code need add task param
+        if clamp_ind:
+            # rte 0.22
+            # cola 0.315
+            # stsb 0.315
+            # sts2 0.95
+            self.clamp_lora_E(model, 0.315) # cola
+        # save lora_E data to rewritter
+        # self.res_lora_E(model)
         return budget, rank_pattern
+
+    def clamp_lora_E(self, model, a):
+        # Calculate the importance score for each sub matrix
+        for n, p in model.named_parameters():
+            if "lora_E" in n:
+                # clamp p to [0, a]
+                p.data = torch.clamp(p.data, min=0, max=a)
+                # res grad info
+                # p.data = p.data.clamp(min=0, max=a)
+
+    # def res_lora_E(self, model):
+    #     lora_E_is = []
+    #     # Calculate the importance score for each sub matrix
+    #     for n, p in model.named_parameters():
+    #         if "lora_E" in n:
+    #             lora_E_is.append(p.view(-1).abs().detach().clone())
+    # 
+    #     all_elements = torch.cat([tensor.flatten() for tensor in lora_E_is])
+    #     self.tb_writter.add_histogram('Lora_E/all_element_dist', all_elements.cpu().numpy(), self.global_step)
 
     def mask_using_rank_pattern(self, model, rank_pattern):
         # Mask the unimportant triplets

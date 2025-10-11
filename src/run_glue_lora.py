@@ -68,6 +68,7 @@ from peft import (
     LoraConfig,
     MSPLoraConfig,
     AdaLoraConfig,
+    DRSLoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
     prepare_model_for_int8_training,
@@ -271,12 +272,77 @@ class ModelArguments:
 
 # this Trainer override the _inner_training_loop(), the details aboves:
 # 1. move the callback func one_step_end before model.zero()
-# 2. delete some no use code
-#TODO: 1 refactor a NewTrainer class, AdaLoRA abstract to AdaLoRACallback add to NewTrainer
-#TODODone
-class NewTrainer(Trainer):
+# 2. loss func add
+# 3. delete some no use code
+#TODO Done: 1 refactor a AdaTrainer class, AdaLoRA abstract to AdaLoRACallback add to AdaTrainer
+class AdaTrainer(Trainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # 安全计算正则项
+        regu_loss = self.compute_svd_orth_regu(model)
+
+        # 加权求和（确保类型和设备一致）
+        loss = loss + self.model.peft_config['default'].orth_reg_weight * regu_loss.to(loss.device)
+
+        return (loss, outputs) if return_outputs else loss
+
+    def compute_svd_orth_regu(self, model):
+        regu_loss = 0.0
+        num_param = 0
+
+        for n, p in model.named_parameters():
+            if "lora_A" in n or "lora_B" in n:
+                # 保持梯度流的核心参数
+                p.requires_grad_()  # 确保梯度计算
+
+                # 计算协方差矩阵（保留梯度）
+                if "lora_A" in n:
+                    para_cov = p @ p.T
+                    I = torch.eye(p.size(0), device=p.device)
+                else:
+                    para_cov = p.T @ p
+                    I = torch.eye(p.size(1), device=p.device)
+
+                # 隔离单位矩阵的梯度
+                I = I.detach()
+
+                num_param += 1
+                if regu_loss is None:
+                    regu_loss = torch.norm(para_cov-I, p="fro")
+                else:
+                    regu_loss += torch.norm(para_cov-I, p="fro")
+
+        return regu_loss / max(num_param, 1) if num_param > 0 else torch.tensor(0.0, device=model.device)
+
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -685,6 +751,95 @@ class NewTrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
+# this Trainer override the _inner_training_loop(), the details aboves:
+# 1. based on AdaTrainer
+# 2. loss func add Rsloss and L2norm_loss
+class DRSTrainer(AdaTrainer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # 安全计算正则项
+        regu_loss = self.compute_svd_orth_regu(model)
+
+        # 加权求和（确保类型和设备一致）
+        loss = loss + self.model.peft_config['default'].orth_reg_weight * regu_loss.to(loss.device)
+
+
+        # mrpc 3450 600 1800 => [600, 1650]
+        # stsb 4500 800 2000 => [800, 2500] now
+        # rte 3900 600 1800 => [600, 2100]
+        # cola 6700 800 3500 => [800, 3200]
+        # sst2 50520 6000 22000 => [6000, 28520]
+
+        #TODO: hard code, need add param or mul a rate
+        if self.state.global_step >= 6000 and self.state.global_step < 28520:
+            #middle add polar_loss
+            # print("!!!!!!!!!!!")
+            RS_loss = self.compute_polar_RS(model, 0)
+            Lnorm_loss = self.compute_polar_Lnorm(model, 2) # L2
+            loss = loss + Lnorm_loss + 0.0001*RS_loss
+
+        return (loss, outputs) if return_outputs else loss
+
+    def compute_polar_RS(self, model, t):
+        num_param = 0
+        p_sum = 0
+        avg = 0
+        RS = 0
+        # calculate avg
+        for n,p in model.named_parameters():
+            if "lora_E" in n:
+                # calculate p_sum
+                p_sum += torch.sum(p)
+                num_param += p.numel()
+        avg = p_sum / num_param
+        # calculate RS and L2
+        for n,p in model.named_parameters():
+            if "lora_E" in n:
+                RS_item = t * torch.sum(torch.abs(p)) - torch.sum(torch.abs(p-avg))
+                RS += RS_item
+        return RS
+
+    def compute_polar_Lnorm(self, model, Lnum):
+        all_lora_E = []
+        num_param = 0
+        for n,p in model.named_parameters():
+            if "lora_E" in n:
+                all_lora_E.append(p.flatten())
+                num_param += p.numel()
+        L2_sum = torch.norm(torch.cat(all_lora_E), p=Lnum)
+        norm_L2_sum = L2_sum / num_param
+        return norm_L2_sum
+
 class LoRAFreezeCallback(TrainerCallback):
     def __init__(self, model, adapter_name, num_epoches, l_num, scale=None):
         self.model = model
@@ -733,8 +888,7 @@ class LoRAFreezeCallback(TrainerCallback):
                 # print(f"Parameter {name} is not frozen.")
                 pass
 
-#TODO: 2 add some AdaLoRA param like init_warmup, end_warmup, beta1, beta2, delaT, orth, init_r, target_r
-#TODODone
+#TODO Done: 2 add some AdaLoRA param like init_warmup, end_warmup, beta1, beta2, delaT, orth, init_r, target_r
 class AdaLoRACallback(TrainerCallback):
     def __init__(self, model):
         self.model = model
@@ -743,14 +897,11 @@ class AdaLoRACallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         curr_rank, mask_threshold = self.model.rankallocator.update_and_allocate(self.model, state.global_step)
 
-#TODO: 3 DRSLoRA need to create a DRSLoRACallback to Trainer or NewTrainer
-class DRSLoRACallback(TrainerCallback):
-    def __init__(self, model):
-        self.model = model
-    def on_train_begin(self, args, state, control, **kwargs):
-        pass
-    def on_step_end(self, args, state, control, **kwargs):
-        pass
+#TODO Done: 3 DRSLoRA need to create a DRSLoRACallback to Trainer or NewTrainer
+class DRSLoRACallback(AdaLoRACallback):
+    """DRSLoRA的子类，回调功能与AdaLoRACallback完全相同，但函数实现不同，具体区别见peft/src/tuner/drslora"""
+    pass
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -907,6 +1058,17 @@ def main():
             lora_dropout=model_args.lora_dropout,
             bias=model_args.lora_bias,
             mode=model_args.mode,
+            task_type=model_args.lora_task_type,
+        )
+    elif 'drs' in model_args.mode:
+        print("*** DRSLoRA !!! ***")
+        #TODO: need check some Param
+        peft_config = DRSLoraConfig(
+            r=model_args.rank[0],
+            lora_alpha=model_args.lora_alpha[0],
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
             task_type=model_args.lora_task_type,
         )
     elif 'ada' in model_args.mode:
@@ -1136,8 +1298,20 @@ def main():
         optimizers=(optimizer, None),
         callbacks=[LoRAFreezeCallback(model, 'default', training_args.num_train_epochs, model_args.l_num)]
     )
+    elif 'drs' in model_args.mode:
+        trainer = DRSTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        optimizers=(optimizer, None),
+        callbacks=[DRSLoRACallback(model)]
+        )
     elif 'ada' in model_args.mode:
-        trainer = NewTrainer(
+        trainer = AdaTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
