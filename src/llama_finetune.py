@@ -18,6 +18,7 @@ from peft import (
     LoraConfig,
     MSPLoraConfig,
     AdaLoraConfig,
+    DRSLoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
     prepare_model_for_int8_training,
@@ -26,6 +27,9 @@ from peft import (
 from transformers import LlamaForCausalLM, LlamaTokenizer, set_seed, TrainerCallback, Trainer
 
 from utils.prompter import Prompter
+
+from Trainers import AdaTrainer, DRSTrainer
+from Callbacks import AdaLoRACallback, DRSLoRACallback
 
 class LoRAFreezeCallback(TrainerCallback):
     def __init__(self, model, adapter_name, num_epoches, l_num, scale=None):
@@ -248,6 +252,28 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
         )
+    elif mode == "ada":
+        #TODO:need to add Ada param
+        print(f"Using ada, lora_r :{lora_r}")
+        config = AdaLoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+    elif mode == "drs":
+        #TODO:need to add Ada param
+        print(f"Using drs, lora_r :{lora_r}")
+        config = DRSLoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
     elif mode == "msplora":
         lora_r = [lora_r]
         while len(lora_r) < lora_n:
@@ -350,6 +376,72 @@ def train(
                 tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
             ),
             callbacks=[LoRAFreezeCallback(model, 'default', num_epochs, lora_n)]
+        )
+    elif 'ada' in mode:
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_data,
+            eval_dataset=val_data,
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=100,
+                num_train_epochs=num_epochs,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=10,
+                dataloader_num_workers=16,
+                dataloader_pin_memory=True,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=200 if val_set_size > 0 else None,
+                save_steps=200,
+                output_dir=output_dir,
+                save_total_limit=3,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name=wandb_run_name if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+            callbacks=[AdaLoRACallback(model)]
+        )
+    elif 'drs' in mode:
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_data,
+            eval_dataset=val_data,
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=100,
+                num_train_epochs=num_epochs,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=10,
+                dataloader_num_workers=16,
+                dataloader_pin_memory=True,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=200 if val_set_size > 0 else None,
+                save_steps=200,
+                output_dir=output_dir,
+                save_total_limit=3,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name=wandb_run_name if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+            callbacks=[DRSLoRACallback(model)]
         )
     else:
         trainer = Trainer(
