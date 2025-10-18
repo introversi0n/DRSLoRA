@@ -7,7 +7,10 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset
+from pathlib import Path
 
+# 将项目根目录添加到Python路径
+sys.path.append(str(Path(__file__).parent.parent))
 """
 Unused imports:
 import torch.nn as nn
@@ -253,10 +256,12 @@ def train(
             task_type="CAUSAL_LM",
         )
     elif mode == "ada":
-        #TODO:need to add Ada param
         print(f"Using ada, lora_r :{lora_r}")
         config = AdaLoraConfig(
-            r=lora_r,
+            init_r=lora_r, # 96
+            target_r=64,
+            tinit=200,
+            tfinal=600,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             lora_dropout=lora_dropout,
@@ -264,10 +269,13 @@ def train(
             task_type="CAUSAL_LM",
         )
     elif mode == "drs":
-        #TODO:need to add Ada param
+        #TODO:need to add DRS param
         print(f"Using drs, lora_r :{lora_r}")
         config = DRSLoraConfig(
-            r=lora_r,
+            init_r=lora_r, # 96
+            target_r=64,
+            tinit=200,
+            tfinal=600,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             lora_dropout=lora_dropout,
@@ -378,7 +386,7 @@ def train(
             callbacks=[LoRAFreezeCallback(model, 'default', num_epochs, lora_n)]
         )
     elif 'ada' in mode:
-        trainer = Trainer(
+        trainer = AdaTrainer(
             model=model,
             train_dataset=train_data,
             eval_dataset=val_data,
@@ -411,7 +419,7 @@ def train(
             callbacks=[AdaLoRACallback(model)]
         )
     elif 'drs' in mode:
-        trainer = Trainer(
+        trainer = DRSTrainer(
             model=model,
             train_dataset=train_data,
             eval_dataset=val_data,
