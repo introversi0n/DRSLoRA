@@ -20,9 +20,40 @@ from transformers.trainer_callback import (
 )
 import math
 import time
+import shutil
+from typing import NamedTuple, Dict
 
 import logging
 logger = logging.getLogger(__name__)
+
+def speed_metrics(split, start_time, num_samples=None, num_steps=None):
+    """
+    Measure and return speed performance metrics.
+
+    This function requires a time snapshot `start_time` before the operation to be measured starts and this function
+    should be run immediately after the operation to be measured has completed.
+
+    Args:
+    - split: name to prefix metric (like train, eval, test...)
+    - start_time: operation start time
+    - num_samples: number of samples processed
+    """
+    runtime = time.time() - start_time
+    result = {f"{split}_runtime": round(runtime, 4)}
+    if runtime == 0:
+        return result
+    if num_samples is not None:
+        samples_per_second = num_samples / runtime
+        result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
+    if num_steps is not None:
+        steps_per_second = num_steps / runtime
+        result[f"{split}_steps_per_second"] = round(steps_per_second, 3)
+    return result
+
+class TrainOutput(NamedTuple):
+    global_step: int
+    training_loss: float
+    metrics: Dict[str, float]
 #依赖提供完毕
 
 # this Trainer override the _inner_training_loop(), the details aboves:
@@ -468,12 +499,14 @@ class AdaTrainer(Trainer):
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             # Wait for everyone to get here so we are sur the model has been saved by process 0.
-            if is_torch_tpu_available():
-                xm.rendezvous("load_best_model_at_end")
-            elif args.parallel_mode == ParallelMode.DISTRIBUTED:
-                dist.barrier()
-            elif is_sagemaker_mp_enabled():
-                smp.barrier()
+            # this is not need in DRSLoRA expriment environment
+            # if you need, delete this note
+            # if is_torch_tpu_available():
+            #     xm.rendezvous("load_best_model_at_end")
+            # elif args.parallel_mode == ParallelMode.DISTRIBUTED:
+            #     dist.barrier()
+            # elif is_sagemaker_mp_enabled():
+            #     smp.barrier()
 
             self._load_best_model()
 
@@ -555,9 +588,9 @@ class DRSTrainer(AdaTrainer):
         # rte 3900 600 1800 => [600, 2100]
         # cola 6700 800 3500 => [800, 3200]
         # sst2 50520 6000 22000 => [6000, 28520]
-
+        # llama 1164 200 600 => [200, 564]
         #TODO: hard code, need add param or mul a rate
-        if self.state.global_step >= 6000 and self.state.global_step < 28520:
+        if self.state.global_step >= 200 and self.state.global_step < 564:
             #middle add polar_loss
             # print("!!!!!!!!!!!")
             RS_loss = self.compute_polar_RS(model, 0)
