@@ -56,7 +56,7 @@ class AdaLoRACallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self.model.rankallocator.set_total_step(state.max_steps)
     def on_step_end(self, args, state, control, **kwargs):
-        curr_rank, mask_threshold = self.rankallocator.update_and_allocate(self.model, state.global_step)
+        curr_rank, mask_threshold = self.model.update_and_allocate(self.model, state.global_step)
 
 #TODO Done: 3 DRSLoRA need to create a DRSLoRACallback to Trainer or NewTrainer
 class DRSLoRACallback(AdaLoRACallback):
