@@ -49,6 +49,9 @@ class LoRAFreezeCallback(TrainerCallback):
                 # print(f"Parameter {name} is not frozen.")
                 pass
 
+# use AdaLoRA rankalloctor to AdaTrainer
+# 1. on_train_begin use set_total_step
+# 2. on_step_end use update_and_allocate (before model.zero_grad())
 #TODO Done: 2 add some AdaLoRA param like init_warmup, end_warmup, beta1, beta2, delaT, orth, init_r, target_r
 class AdaLoRACallback(TrainerCallback):
     def __init__(self, model):
@@ -58,6 +61,8 @@ class AdaLoRACallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         curr_rank, mask_threshold = self.model.update_and_allocate(self.model, state.global_step)
 
+# 1. based on AdaLoRACallback
+# 2. rankalloctor function different of Ada,
 #TODO Done: 3 DRSLoRA need to create a DRSLoRACallback to Trainer or NewTrainer
 class DRSLoRACallback(AdaLoRACallback):
     """DRSLoRA的子类，回调功能与AdaLoRACallback完全相同，但函数实现不同，具体区别见peft/src/tuner/drslora"""
