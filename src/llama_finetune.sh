@@ -1,8 +1,8 @@
 #!/bin/bash
 export WANDB_MODE=offline
 export HF_ENDPOINT=https://hf-mirror.com
-# export HF_HOME=~/autodl-tmp # autoDL
-export HF_HOME=./data # yours
+export HF_HOME=~/autodl-tmp # autoDL
+# export HF_HOME=./data # yours
 gpu=0
 
 run(){
@@ -26,7 +26,9 @@ run(){
   exp_dir=./llama-lora-${mode}/${wandb_run_name}
   mkdir -p $exp_dir
   
-  CUDA_VISIBLE_DEVICES=$gpu python llama_finetune.py \
+  START_TIME=$(date +%s)
+  echo "===== ${mode} Train started at: $(date) =====" > "${exp_dir}/time.txt"
+  CUDA_VISIBLE_DEVICES=$gpu python ./src/llama_finetune.py \
     --base_model=meta-llama/Llama-2-7b-hf \
     --cutoff_len=$cutoff_len \
     --mode=$mode \
@@ -45,13 +47,24 @@ run(){
     --wandb_project=$wandb_project \
     --wandb_run_name=$wandb_run_name \
     --output_dir=${exp_dir}/model
+  
+  END_TIME=$(date +%s)
+  ELAPSED_TIME=$((END_TIME - START_TIME))
+  echo "===== ${mode} Train completed at: $(date) =====" >> "${exp_dir}/time.txt"
+  echo "===== Elapsed time: ${ELAPSED_TIME} seconds =====" >> "${exp_dir}/time.txt"
 }
 
 seeds=(42)
 l_nums=(3)
 
 # run LoRA with rank 64, seed 42
-run 'base' 64 1 42
+# run 'base' 64 1 42
+
+# # # run DrsLoRA with rank 96to64, seed 42
+# run 'drs' 96 1 41
+
+# # # run AdaLoRA with rank 96to64, seed 42
+# run 'ada' 96 1 41
 
 # run MSPLoRA with rank 64, lora_num 3, seed 42
-#run 'msplora' 64 3 42
+run 'msplora' 64 3 41

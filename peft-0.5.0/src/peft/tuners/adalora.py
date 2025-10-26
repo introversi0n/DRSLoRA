@@ -133,6 +133,7 @@ class AdaLoraModel(LoraModel):
     """
 
     def __init__(self, model, config, adapter_name):
+        # import pdb;pdb.set_trace()
         super().__init__(model, config, adapter_name)
 
         traininable_mode_counter = 0
@@ -322,7 +323,12 @@ class AdaLoraModel(LoraModel):
         return outputs
 
     def resize_modules_by_rank_pattern(self, rank_pattern, adapter_name):
+        # import pdb;pdb.set_trace()
+        return rank_pattern
         lora_config = self.peft_config[adapter_name]
+        # 创建新的rank_pattern字典来存储更新后的掩码
+        new_rank_pattern = {}
+        
         for name, rank_idx in rank_pattern.items():
             if isinstance(rank_idx, list):
                 rank = sum(rank_idx)
@@ -330,13 +336,18 @@ class AdaLoraModel(LoraModel):
                 rank_idx = rank_idx.view(-1)
                 rank = rank_idx.sum().item()
             else:
-                raise ValueError("Unexcepted type of rank_idx")
+                raise ValueError("Unexpected type of rank_idx")
+            
             key = ".".join(name.split(".")[0:-2]) if adapter_name in name else ".".join(name.split(".")[0:-1])
             _, target, _ = _get_submodules(self.model, key)
+            
+            # 提取权重
             lora_E_weights = target.lora_E[adapter_name][rank_idx]
             lora_A_weights = target.lora_A[adapter_name][rank_idx]
             lora_B_weights = target.lora_B[adapter_name][:, rank_idx]
             ranknum = target.ranknum[adapter_name]
+            
+            # 调整模块大小
             target.update_layer(
                 adapter_name,
                 rank,
@@ -344,20 +355,28 @@ class AdaLoraModel(LoraModel):
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
             )
+            
             with torch.no_grad():
                 if rank > 0:
                     target.lora_E[adapter_name].copy_(lora_E_weights)
                     target.lora_A[adapter_name].copy_(lora_A_weights)
                     target.lora_B[adapter_name].copy_(lora_B_weights)
-                    # The scaling is exactly as the previous
                     target.ranknum[adapter_name].copy_(ranknum)
+            
+            # 创建新的rank_pattern匹配调整后的维度
+            # 全为True表示保留所有调整后的奇异值
+            new_rank_pattern[name] = [True] * rank
+        
+        return new_rank_pattern  # 返回更新后的rank_pattern
 
     def resize_state_dict_by_rank_pattern(self, rank_pattern, state_dict, adapter_name):
+        return state_dict
+        # import pdb;pdb.set_trace()
         for name, rank_idx in rank_pattern.items():
             rank = sum(rank_idx)
             prefix = ".".join(name.split(".")[0:-2]) if adapter_name in name else ".".join(name.split(".")[0:-1])
             for layer in ["lora_E", "lora_A", "lora_B"]:
-                key = f"base_model.model.{prefix}.{layer}.{adapter_name}"
+                key = f"base_model.model.{prefix}.{layer}.{adapter_name}" # this add default to match state_dict
                 if layer != "lora_B":
                     state_dict[key] = (
                         state_dict[key][rank_idx] if rank != state_dict[key].shape[0] else state_dict[key]
@@ -369,6 +388,7 @@ class AdaLoraModel(LoraModel):
         return state_dict
 
     def update_and_allocate(self, global_step):
+        # import pdb;pdb.set_trace()
         lora_config = self.peft_config[self.trainable_adapter_name]
         # Update the importance score and allocate the budget
         if global_step < lora_config.total_step - lora_config.tfinal:
@@ -379,7 +399,8 @@ class AdaLoraModel(LoraModel):
         elif global_step == lora_config.total_step - lora_config.tfinal:
             _, rank_pattern = self.rankallocator.update_and_allocate(self.model, global_step, force_mask=True)
             # for some reason, this freezes the trainable parameters and nothing gets updates
-            # self.resize_modules_by_rank_pattern(rank_pattern, self.trainable_adapter_name)
+            # new_rank_pattern = self.resize_modules_by_rank_pattern(rank_pattern, self.trainable_adapter_name)
+            # lora_config.rank_pattern = new_rank_pattern
             lora_config.rank_pattern = rank_pattern
             self.rankallocator.reset_ipt()
         # Currently using inefficient way to mask the unimportant weights using the rank pattern
@@ -389,7 +410,6 @@ class AdaLoraModel(LoraModel):
         # Pass the function and do forward propagation
         else:
             return None
-
 
 class SVDLinear(nn.Linear, AdaLoraLayer):
     # SVD-based adaptation by a dense layer

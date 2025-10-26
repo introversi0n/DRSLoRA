@@ -5,7 +5,7 @@ import os
 # 加载基础模型（需提前下载或指定本地路径）
 base_model_path = "/root/autodl-tmp/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9"
 # 你的 LoRA 适配器目录
-lora_path = "/root/autodl-fs/MSPLoRA/llama-lora-drs/llama-msplora-qv-drs-stage-false-r-96-n-1-alpha-16-seed-42-bs-128-lr-3e-4-len-256-epochs-3/model"  
+lora_path = "/root/autodl-fs/MSPLoRA/llama-lora-msplora/llama-msplora-qv-msplora-stage-false-r-64-n-3-alpha-16-seed-41-bs-128-lr-3e-4-len-256-epochs-3/model"  
 # 指定合并后的模型保存路径
 output_path = os.path.join(lora_path, "merge_model")  # 在lora_path下创建merge_model子目录
 

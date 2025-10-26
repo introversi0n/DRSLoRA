@@ -1,12 +1,12 @@
 #!/bin/bash
 export WANDB_MODE=offline
 export HF_ENDPOINT=https://hf-mirror.com
-# export HF_HOME=~/autodl-tmp # autoDL
-export HF_HOME=./data # yours
+export HF_HOME=~/autodl-tmp # autoDL
+# export HF_HOME=./data # yours
 gpu=0
 
 declare -A epochs=(["mrpc"]=30 ["qnli"]=25 ["rte"]=80 ["sst2"]=60 ["stsb"]=40 ["cola"]=80)
-declare -A bs=(["mrpc"]=64 ["qnli"]=64 ["rte"]=64 ["sst2"]=64 ["stsb"]=64 ["cola"]=16)
+declare -A bs=(["mrpc"]=64 ["qnli"]=64 ["rte"]=64 ["sst2"]=64 ["stsb"]=64 ["cola"]=64)
 declare -A ml=(["mrpc"]=256 ["qnli"]=256 ["rte"]=512 ["sst2"]=256 ["stsb"]=256 ["cola"]=256)
 declare -A lr=(["mrpc"]="4e-4" ["qnli"]="4e-4" ["rte"]="4e-4" ["sst2"]="5e-4" ["stsb"]="4e-4" ["cola"]="4e-4")
 declare -A metrics=(["mrpc"]="accuracy" ["qnli"]="accuracy" ["rte"]="accuracy" ["sst2"]="accuracy" ["stsb"]="pearson" ["cola"]="matthews_correlation")

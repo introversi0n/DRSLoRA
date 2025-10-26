@@ -60,11 +60,16 @@ def get_peft_model_state_dict(model, state_dict=None, adapter_name="default"):
             raise NotImplementedError
         # to_return = {k: v for k, v in to_return.items() if (("lora_" in k and adapter_name in k) or ("bias" in k))}
         if config.peft_type == PeftType.ADALORA:
+            # import pdb;pdb.set_trace()
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
-                rank_pattern = {k.replace(f".{adapter_name}", ""): v for k, v in rank_pattern.items()}
+                # rank_pattern = {k.replace(f".{adapter_name}", ""): v for k, v in rank_pattern.items()} # note this to save adapter_name for Ada's resize_state_dict_by_rank_pattern
+                to_return = {
+                    k if f".{adapter_name}" in k else f"{k}.{adapter_name}": v
+                    for k, v in to_return.items()
+                }# recover adapter_name 
                 config.rank_pattern = rank_pattern
-                to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
+                # to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name) # note this because state_dict tensor size mismatch
 
     elif config.peft_type == PeftType.ADAPTION_PROMPT:
         to_return = {k: state_dict[k] for k in state_dict if k.split(".")[-1].startswith("adaption_")}
@@ -145,7 +150,7 @@ def set_peft_model_state_dict(model, peft_model_state_dict, adapter_name="defaul
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
                 model.resize_modules_by_rank_pattern(rank_pattern, adapter_name)
-    elif config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.IA3):
+    elif config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.DRSLORA, PeftType.IA3):
         peft_model_state_dict = {}
         parameter_prefix = "ia3_" if config.peft_type == PeftType.IA3 else "lora_"
         for k, v in state_dict.items():

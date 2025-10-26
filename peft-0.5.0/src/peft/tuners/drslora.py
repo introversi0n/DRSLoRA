@@ -322,7 +322,11 @@ class DRSLoraModel(LoraModel):
         return outputs
 
     def resize_modules_by_rank_pattern(self, rank_pattern, adapter_name):
+        return rank_pattern
         lora_config = self.peft_config[adapter_name]
+        # 创建新的rank_pattern字典来存储更新后的掩码
+        new_rank_pattern = {}
+        
         for name, rank_idx in rank_pattern.items():
             if isinstance(rank_idx, list):
                 rank = sum(rank_idx)
@@ -330,13 +334,18 @@ class DRSLoraModel(LoraModel):
                 rank_idx = rank_idx.view(-1)
                 rank = rank_idx.sum().item()
             else:
-                raise ValueError("Unexcepted type of rank_idx")
+                raise ValueError("Unexpected type of rank_idx")
+            
             key = ".".join(name.split(".")[0:-2]) if adapter_name in name else ".".join(name.split(".")[0:-1])
             _, target, _ = _get_submodules(self.model, key)
+            
+            # 提取权重
             lora_E_weights = target.lora_E[adapter_name][rank_idx]
             lora_A_weights = target.lora_A[adapter_name][rank_idx]
             lora_B_weights = target.lora_B[adapter_name][:, rank_idx]
             ranknum = target.ranknum[adapter_name]
+            
+            # 调整模块大小
             target.update_layer(
                 adapter_name,
                 rank,
@@ -344,15 +353,22 @@ class DRSLoraModel(LoraModel):
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
             )
+            
             with torch.no_grad():
                 if rank > 0:
                     target.lora_E[adapter_name].copy_(lora_E_weights)
                     target.lora_A[adapter_name].copy_(lora_A_weights)
                     target.lora_B[adapter_name].copy_(lora_B_weights)
-                    # The scaling is exactly as the previous
                     target.ranknum[adapter_name].copy_(ranknum)
+            
+            # 创建新的rank_pattern匹配调整后的维度
+            # 全为True表示保留所有调整后的奇异值
+            new_rank_pattern[name] = [True] * rank
+        
+        return new_rank_pattern  # 返回更新后的rank_pattern
 
     def resize_state_dict_by_rank_pattern(self, rank_pattern, state_dict, adapter_name):
+        return state_dict
         for name, rank_idx in rank_pattern.items():
             rank = sum(rank_idx)
             prefix = ".".join(name.split(".")[0:-2]) if adapter_name in name else ".".join(name.split(".")[0:-1])
@@ -379,9 +395,9 @@ class DRSLoraModel(LoraModel):
         elif global_step == lora_config.total_step - lora_config.tfinal:
             _, rank_pattern = self.rankallocator.update_and_allocate(self.model, global_step, force_mask=True)
             # for some reason, this freezes the trainable parameters and nothing gets updates
-            # self.resize_modules_by_rank_pattern(rank_pattern, self.trainable_adapter_name)
+            # new_rank_pattern = self.resize_modules_by_rank_pattern(rank_pattern, self.trainable_adapter_name)
+            # lora_config.rank_pattern = new_rank_pattern
             lora_config.rank_pattern = rank_pattern
-            self.rankallocator.reset_ipt()
         # Currently using inefficient way to mask the unimportant weights using the rank pattern
         #  due to problem mentioned above
         elif global_step > lora_config.total_step - lora_config.tfinal:
@@ -681,7 +697,8 @@ class RankAllocator(object):
 
         self.reset_ipt()
         self._set_budget_scheduler(model)
-
+        self.max_lora_E_element = 0
+        
     def set_total_step(self, total_step):
         self.peft_config.total_step = total_step
 
@@ -702,7 +719,7 @@ class RankAllocator(object):
         self.target_bgt = self.peft_config.target_r * len(self.name_set)
 
     def budget_schedule(self, step: int):
-        clamp_ind = False
+        # process_ind is -1, 0, 1, 2 represent init, middle, final
         mask_value=0
         tinit = self.peft_config.tinit
         tfinal = self.peft_config.tfinal
@@ -710,40 +727,23 @@ class RankAllocator(object):
         # Initial warmup
         if step <= tinit:
             budget = self.init_bgt
-            mask_ind = False
+            process_ind = -1
         # Final fine-tuning
         elif step > total_step - tfinal:
             budget = self.target_bgt
-            mask_ind = True
+            process_ind = 2
         else:
             # AdaLora code delete
             # # Budget decreasing with a cubic scheduler
             # mul_coeff = 1 - (step - tinit) / (total_step - tfinal - tinit)
             # budget = int((self.init_bgt - self.target_bgt) * (mul_coeff**3) + self.target_bgt)
-            # mask_ind = True if step % self.peft_config.deltaT == 0 else False
+            # process_ind = True if step % self.peft_config.deltaT == 0 else False
 
             # DRSLora
             budget = self.target_bgt
-            mask_ind = True if step == total_step - tfinal else False
-            clamp_ind = True
-        return budget, mask_ind, clamp_ind
+            process_ind = 0 if step == total_step - tfinal else 1
+        return budget, process_ind
 
-    def update_ipt(self, model):
-        # Update the sensitivity and uncertainty for every weight
-        for n, p in model.named_parameters():
-            if "lora_" in n and self.adapter_name in n:
-                if n not in self.ipt:
-                    self.ipt[n] = torch.zeros_like(p)
-                    self.exp_avg_ipt[n] = torch.zeros_like(p)
-                    self.exp_avg_unc[n] = torch.zeros_like(p)
-                with torch.no_grad():
-                    self.ipt[n] = (p * p.grad).abs().detach()
-                    # Sensitivity smoothing
-                    self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
-                    # Uncertainty quantification
-                    self.exp_avg_unc[n] = (
-                        self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-                    )
 
     def _element_score(self, n):
         return self.exp_avg_ipt[n] * self.exp_avg_unc[n]
@@ -754,43 +754,43 @@ class RankAllocator(object):
         return sum_ipt
 
     def mask_to_budget(self, model, curr_rank):
-        value_ipt = {}
-        vector_ipt = {}
-        triplet_ipt = {}
+        # value_ipt = {}
+        # vector_ipt = {}
+        # triplet_ipt = {}
         lora_E_is = []
         # Get the importance score for A, E, B
         for n, p in model.named_parameters():
-            if f"lora_A.{self.adapter_name}" in n:
-                entry_ipt = self._element_score(n)
-                comb_ipt = torch.mean(entry_ipt, dim=1, keepdim=True)
-                name_m = n.replace("lora_A", "%s")
-                if name_m not in vector_ipt:
-                    vector_ipt[name_m] = [comb_ipt]
-                else:
-                    vector_ipt[name_m].append(comb_ipt)
-            if f"lora_B.{self.adapter_name}" in n:
-                entry_ipt = self._element_score(n)
-                comb_ipt = torch.mean(entry_ipt, dim=0, keepdim=False).view(-1, 1)
-                name_m = n.replace("lora_B", "%s")
-                if name_m not in vector_ipt:
-                    vector_ipt[name_m] = [comb_ipt]
-                else:
-                    vector_ipt[name_m].append(comb_ipt)
+            # if f"lora_A.{self.adapter_name}" in n:
+            #     entry_ipt = self._element_score(n)
+            #     comb_ipt = torch.mean(entry_ipt, dim=1, keepdim=True)
+            #     name_m = n.replace("lora_A", "%s")
+            #     if name_m not in vector_ipt:
+            #         vector_ipt[name_m] = [comb_ipt]
+            #     else:
+            #         vector_ipt[name_m].append(comb_ipt)
+            # if f"lora_B.{self.adapter_name}" in n:
+            #     entry_ipt = self._element_score(n)
+            #     comb_ipt = torch.mean(entry_ipt, dim=0, keepdim=False).view(-1, 1)
+            #     name_m = n.replace("lora_B", "%s")
+            #     if name_m not in vector_ipt:
+            #         vector_ipt[name_m] = [comb_ipt]
+            #     else:
+            #         vector_ipt[name_m].append(comb_ipt)
             if f"lora_E.{self.adapter_name}" in n:
-                entry_ipt = self._element_score(n)
-                name_m = n.replace("lora_E", "%s")
-                value_ipt[name_m] = entry_ipt
+                # entry_ipt = self._element_score(n)
+                # name_m = n.replace("lora_E", "%s")
+                # value_ipt[name_m] = entry_ipt
                 lora_E_is.append(p.view(-1).abs().detach().clone())
 
-        all_score = []
-        # Calculate the score for each triplet
-        for name_m in vector_ipt:
-            ipt_E = value_ipt[name_m]
-            ipt_AB = torch.cat(vector_ipt[name_m], dim=1)
-            sum_ipt = self._combine_ipt(ipt_E, ipt_AB)
-            name_E = name_m % "lora_E"
-            triplet_ipt[name_E] = sum_ipt.view(-1, 1)
-            all_score.append(sum_ipt.view(-1))
+        # all_score = []
+        # # Calculate the score for each triplet
+        # for name_m in vector_ipt:
+        #     ipt_E = value_ipt[name_m]
+        #     ipt_AB = torch.cat(vector_ipt[name_m], dim=1)
+        #     sum_ipt = self._combine_ipt(ipt_E, ipt_AB)
+        #     name_E = name_m % "lora_E"
+        #     triplet_ipt[name_E] = sum_ipt.view(-1, 1)
+        #     all_score.append(sum_ipt.view(-1))
 
         # AdaLora delete
         # # Get the threshold by ranking ipt
@@ -799,7 +799,7 @@ class RankAllocator(object):
         #     k=self.init_bgt - budget,
         # )[0].item()
 
-        mask_threshold = torch.kthvalue(torch.cat(lora_E_is), (self.total_rank - curr_rank))[0].item()
+        mask_threshold = torch.kthvalue(torch.cat(lora_E_is), (self.init_bgt - curr_rank))[0].item()
         rank_pattern = {}
         # Mask the unimportant triplets
         with torch.no_grad():
@@ -808,28 +808,31 @@ class RankAllocator(object):
                     # Adalora delete
                     # p.masked_fill_(triplet_ipt[n] <= mask_threshold, 0.0)
                     # DRSLora
-                    p.data.masked_fill_(p.data <= mask_threshold, 0.0)
-                    rank_pattern[n] = (~(triplet_ipt[n] <= mask_threshold)).view(-1).tolist()
+                    mask = (p.data <= mask_threshold)
+                    p.data.masked_fill_(mask, 0.0)
+                    # dont backward
+                    # rank_pattern[n] = (~(triplet_ipt[n] <= mask_threshold)).view(-1).tolist()
+                    rank_pattern[n] = (~mask).view(-1).tolist()
         return rank_pattern
 
     def update_and_allocate(self, model, global_step, force_mask=False):
-        # # Update the importance score and allocate the budget
-        if global_step < self.peft_config.total_step - self.peft_config.tfinal:
-            self.update_ipt(model)
-        budget, mask_ind, clamp_ind = self.budget_schedule(global_step)
-        # Allocate the budget according to importance scores
-        if mask_ind or force_mask:
+        budget, process_ind = self.budget_schedule(global_step)
+        
+        if process_ind == 1 or force_mask:
             rank_pattern = self.mask_to_budget(model, budget)
         else:
             rank_pattern = None
-        # clamp to control lora_E
-        # TODO:hard code need add task param
-        if clamp_ind:
+        # collect in init_warmup
+        if process_ind == -1:
+            self.max_lora_E_element = max(self.max_lora_E_element,
+                                          self.compute_max_singular_value(model))
+        # clamp to control lora_E in middle
+        if process_ind == 0:
             # rte 0.22
             # cola 0.315
             # stsb 0.315
             # sts2 0.95
-            self.clamp_lora_E(model, 0.315) # cola
+            self.clamp_lora_E(model, self.max_lora_E_element) # cola
         # save lora_E data to rewritter
         # self.res_lora_E(model)
         return budget, rank_pattern
@@ -842,6 +845,17 @@ class RankAllocator(object):
                 p.data = torch.clamp(p.data, min=0, max=a)
                 # res grad info
                 # p.data = p.data.clamp(min=0, max=a)
+
+
+    def compute_max_singular_value(self, model):
+        max_singular = 0
+        for name, param in model.named_parameters():
+            if "lora_E" in name:  # 找到所有LoRA_E矩阵
+                # 假设lora_E是奇异值的对角矩阵或向量
+                current_max = torch.max(torch.abs(param.data)).item()  # 直接取绝对值最大值
+                if current_max > max_singular:
+                    max_singular = current_max
+        return max_singular
 
     # def res_lora_E(self, model):
     #     lora_E_is = []

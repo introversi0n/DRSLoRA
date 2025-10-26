@@ -59,7 +59,7 @@ class AdaLoRACallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self.model.rankallocator.set_total_step(state.max_steps)
     def on_step_end(self, args, state, control, **kwargs):
-        curr_rank, mask_threshold = self.model.update_and_allocate(self.model, state.global_step)
+        self.model.update_and_allocate(state.global_step)
 
 # 1. based on AdaLoRACallback
 # 2. rankalloctor function different of Ada,
