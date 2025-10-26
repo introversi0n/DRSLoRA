@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE."""
+import copy
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
 import json
@@ -59,6 +60,8 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
+# SRLoRA
+from SRLoRA.SR_cal import calibrate_lora_ranks
 from Trainers import AdaTrainer, DRSTrainer
 from Callbacks import LoRAFreezeCallback, AdaLoRACallback, DRSLoRACallback
 
@@ -252,6 +255,18 @@ class ModelArguments:
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
+    use_sr_rank_allocation: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Whether to use Stable Rank for LoRA rank allocation"},# 选择是否在LoRA中加入稳定秩
+    )
+    lora_budget_rank: Optional[int] = field(
+        default=24*8,
+        metadata={"help": "Total rank budget for LoRA"},# LoRA的总体秩预算
+    )
+    calib_batch_size: Optional[int] = field(
+        default=16,
+        metadata={"help": "Batch size for calibration"},# 稳定秩校准用batchsize大小
+    )
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -399,96 +414,7 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
         ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
     )
-    # PEFT
-    if 'msp' in model_args.mode:
-        print("*** MSPLora !!! ***")
-        peft_config = MSPLoraConfig(
-            r=model_args.rank,
-            lora_alpha=model_args.lora_alpha,
-            target_modules=model_args.target_modules,
-            lora_dropout=model_args.lora_dropout,
-            bias=model_args.lora_bias,
-            mode=model_args.mode,
-            task_type=model_args.lora_task_type,
-        )
-    elif 'drs' in model_args.mode:
-        print("*** DRSLoRA !!! ***")
-        #TODO: need check some Param
-        peft_config = DRSLoraConfig(
-            r=model_args.rank[0],
-            lora_alpha=model_args.lora_alpha[0],
-            target_modules=model_args.target_modules,
-            lora_dropout=model_args.lora_dropout,
-            bias=model_args.lora_bias,
-            task_type=model_args.lora_task_type,
-        )
-    elif 'ada' in model_args.mode:
-        print("*** AdaLoRA !!! ***")
-        #TODO: need check some Param
-        peft_config = AdaLoraConfig(
-            r=model_args.rank[0],
-            lora_alpha=model_args.lora_alpha[0],
-            target_modules=model_args.target_modules,
-            lora_dropout=model_args.lora_dropout,
-            bias=model_args.lora_bias,
-            task_type=model_args.lora_task_type,
-        )
-    elif 'base' in model_args.mode:
-        print("*** Just Lora !!! ***")
-        peft_config = LoraConfig(
-            r=model_args.rank[0],
-            lora_alpha=model_args.lora_alpha[0],
-            target_modules=model_args.target_modules,
-            lora_dropout=model_args.lora_dropout,
-            bias=model_args.lora_bias,
-            task_type=model_args.lora_task_type,
-        )
-    else:
-        raise ValueError(f"Unknown mode {model_args.mode}")
-    # PEFT
-    def print_lora_parameters(model):
-        r"""
-        Returns the number of trainable parameters and number of all parameters in the model.
-        """
-        trainable_params = 0
-        lora_params = 0
-        all_param = 0
-        for n, param in model.named_parameters():
-            num_params = param.numel()
-            # if using DS Zero 3 and the weights are initialized empty
-            if num_params == 0 and hasattr(param, "ds_numel"):
-                num_params = param.ds_numel
 
-            # Due to the design of 4bit linear layers from bitsandbytes
-            # one needs to multiply the number of parameters by 2 to get
-            # the correct number of parameters
-            if param.__class__.__name__ == "Params4bit":
-                num_params = num_params * 2
-
-            all_param += num_params
-            if 'original_module' in n:
-                continue
-            if param.requires_grad:
-                trainable_params += num_params
-                if "lora_" not in n:
-                    print(n)
-                elif "lora_" in n:
-                    lora_params += num_params
-        print(
-            f"lora params: {lora_params:,d} || trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
-        )
-        return lora_params
-    model = get_peft_model(model, peft_config)
-
-    for name, param in model.named_parameters():
-        print(name)
-
-    print("*** Parameter number after share ***")
-
-    # 查看可训练参数
-    model.print_trainable_parameters()
-
-    print_lora_parameters(model)
     if model_args.lora_path is not None and data_args.task_name in ['mrpc', 'rte', 'stsb']:
         print(f"*** Load MNLI weight from {os.path.join(model_args.lora_path,'adapter_model.bin')} ***")
         adapters_weights = torch.load(os.path.join(model_args.lora_path,'adapter_model.bin'), map_location=model.device)
@@ -602,6 +528,137 @@ def main():
     if training_args.do_train:
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
+    # we already did the padding.
+    if data_args.pad_to_max_length:
+        data_collator = default_data_collator
+    elif training_args.fp16:
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+    else:
+        data_collator = None
+
+    # ========== 插入校准代码 ==========
+    if model_args.use_sr_rank_allocation:
+        model = model.to(training_args.device)
+        lora_r_per_layer = calibrate_lora_ranks(
+            model=model,
+            train_dataset=train_dataset,
+            data_collator=data_collator,
+            training_args=training_args,
+            logger=logger,
+            calib_size=model_args.calib_batch_size,
+            budget_rank=model_args.lora_budget_rank,
+            seed = training_args.seed,
+            num_batches=10 # if dont set, default iterator total dataset
+        )
+
+    # 校准完成后立即释放 model_noLoRA 的显存
+    torch.cuda.empty_cache()  # 清理GPU缓存
+    # return
+    # ======================================
+
+    # PEFT
+    if 'msp' in model_args.mode:
+        print("*** MSPLora !!! ***")
+        peft_config = MSPLoraConfig(
+            r=model_args.rank,
+            lora_alpha=model_args.lora_alpha,
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
+            mode=model_args.mode,
+            task_type=model_args.lora_task_type,
+        )
+    elif 'drs' in model_args.mode:
+        print("*** DRSLoRA !!! ***")
+        #TODO: need check some Param
+        peft_config = DRSLoraConfig(
+            r=model_args.rank[0],
+            lora_alpha=model_args.lora_alpha[0],
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
+            task_type=model_args.lora_task_type,
+        )
+    elif 'ada' in model_args.mode:
+        print("*** AdaLoRA !!! ***")
+        #TODO: need check some Param
+        peft_config = AdaLoraConfig(
+            r=model_args.rank[0],
+            lora_alpha=model_args.lora_alpha[0],
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
+            task_type=model_args.lora_task_type,
+        )
+    elif 'base' in model_args.mode:
+        print("*** Just Lora !!! ***")
+        peft_config = LoraConfig(
+            r=model_args.rank[0],
+            lora_alpha=model_args.lora_alpha[0],
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
+            task_type=model_args.lora_task_type,
+        )
+    elif 'sr' in model_args.mode:
+        print("*** SRLoRA !!! ***")
+        peft_config = LoraConfig(
+            r=model_args.rank[0],
+            lora_alpha=model_args.lora_alpha[0],
+            target_modules=model_args.target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias=model_args.lora_bias,
+            task_type=model_args.lora_task_type,
+        )
+        peft_config.lora_r_per_layer=lora_r_per_layer
+    else:
+        raise ValueError(f"Unknown mode {model_args.mode}")
+    # PEFT
+    def print_lora_parameters(model):
+        r"""
+        Returns the number of trainable parameters and number of all parameters in the model.
+        """
+        trainable_params = 0
+        lora_params = 0
+        all_param = 0
+        for n, param in model.named_parameters():
+            num_params = param.numel()
+            # if using DS Zero 3 and the weights are initialized empty
+            if num_params == 0 and hasattr(param, "ds_numel"):
+                num_params = param.ds_numel
+
+            # Due to the design of 4bit linear layers from bitsandbytes
+            # one needs to multiply the number of parameters by 2 to get
+            # the correct number of parameters
+            if param.__class__.__name__ == "Params4bit":
+                num_params = num_params * 2
+
+            all_param += num_params
+            if 'original_module' in n:
+                continue
+            if param.requires_grad:
+                trainable_params += num_params
+                if "lora_" not in n:
+                    print(n)
+                elif "lora_" in n:
+                    lora_params += num_params
+        print(
+            f"lora params: {lora_params:,d} || trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
+        )
+        return lora_params
+
+    model = get_peft_model(model, peft_config)
+    for name, param in model.named_parameters():
+        print(name)
+
+    print("*** Parameter number after share ***")
+
+    # 查看可训练参数
+    model.print_trainable_parameters()
+
+    print_lora_parameters(model)
     
     # Get the metric function
     if data_args.task_name is not None:
@@ -621,15 +678,6 @@ def main():
         if len(result) > 1:
             result["combined_score"] = np.mean(list(result.values())).item()
         return result
-
-    # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
-    # we already did the padding.
-    if data_args.pad_to_max_length:
-        data_collator = default_data_collator
-    elif training_args.fp16:
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
-    else:
-        data_collator = None
 
     # Initialize our Trainer model.base_model.model.classifier.parameters()
     head_params = list(map(id, model.base_model.model.classifier.parameters()))
@@ -673,7 +721,7 @@ def main():
         optimizers=(optimizer, None),
         callbacks=[AdaLoRACallback(model)]
         )
-    else:
+    else:#base or sr
         trainer = Trainer(
             model=model,
             args=training_args,

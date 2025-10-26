@@ -327,8 +327,15 @@ class LoraModel(BaseTuner):
         **optionnal_kwargs,
     ):
         bias = hasattr(target, "bias") and target.bias is not None
+
+        if lora_config.lora_r_per_layer is not None:
+            layer_idx = int(re.search(r'layer\.([^.]+)', optionnal_kwargs.pop("current_key")).group(1))
+            rank = lora_config.lora_r_per_layer[layer_idx][target_name]
+        else:
+            rank = lora_config.r
+
         kwargs = {
-            "r": lora_config.r,
+            "r": rank,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
@@ -346,7 +353,7 @@ class LoraModel(BaseTuner):
         if isinstance(target, LoraLayer) and isinstance(target, torch.nn.Conv2d):
             target.update_layer_conv2d(
                 adapter_name,
-                lora_config.r,
+                rank,
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
@@ -354,7 +361,7 @@ class LoraModel(BaseTuner):
         elif isinstance(target, LoraLayer) and isinstance(target, torch.nn.Embedding):
             target.update_layer_embedding(
                 adapter_name,
-                lora_config.r,
+                rank,
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
@@ -363,7 +370,7 @@ class LoraModel(BaseTuner):
         elif isinstance(target, LoraLayer):
             target.update_layer(
                 adapter_name,
-                lora_config.r,
+                rank,
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
