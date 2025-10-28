@@ -828,10 +828,6 @@ class RankAllocator(object):
                                           self.compute_max_singular_value(model))
         # clamp to control lora_E in middle
         if process_ind == 0:
-            # rte 0.22
-            # cola 0.315
-            # stsb 0.315
-            # sts2 0.95
             self.clamp_lora_E(model, self.max_lora_E_element) # cola
         # save lora_E data to rewritter
         # self.res_lora_E(model)
