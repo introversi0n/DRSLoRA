@@ -261,12 +261,16 @@ class ModelArguments:
         default=True,
         metadata={"help": "Whether to use Stable Rank for LoRA rank allocation"},# 选择是否在LoRA中加入稳定秩
     )
+    softnorm: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use Stable Rank for LoRA rank allocation"},# 选择是否对稳定秩结果使用softmax正则化，False则使用最大最小归一化
+    )    
     lora_budget_rank: Optional[int] = field(
         default=24*8,
         metadata={"help": "Total rank budget for LoRA"},# LoRA的总体秩预算
     )
     calib_batch_size: Optional[int] = field(
-        default=16,
+        default=64,
         metadata={"help": "Batch size for calibration"},# 稳定秩校准用batchsize大小
     )
 
@@ -541,18 +545,19 @@ def main():
         data_collator = None
 
     # ========== 插入校准代码 ==========
+    lora_r_per_layer = None
     if model_args.use_sr_rank_allocation:
-        model = model.to(training_args.device)
         lora_r_per_layer = calibrate_lora_ranks(
             model=model,
             train_dataset=train_dataset,
             data_collator=data_collator,
-            training_args=training_args,
             logger=logger,
             calib_size=model_args.calib_batch_size,
             budget_rank=model_args.lora_budget_rank,
             seed = training_args.seed,
-            num_batches=10 # if dont set, default iterator total dataset
+            data_args = data_args,
+            softnorm = model_args.softnorm,
+            # num_batches=10 # if dont set, default iterator total dataset
         )
 
     # 校准完成后立即释放 model_noLoRA 的显存
@@ -560,6 +565,8 @@ def main():
     # return
     # ======================================
 
+    # 保存模型数量限制
+    training_args.save_total_limit=2
     # PEFT
     if 'msp' in model_args.mode:
         print("*** MSPLora !!! ***")
@@ -576,7 +583,10 @@ def main():
         print("*** DRSLoRA !!! ***")
         #TODO: need check some Param
         peft_config = DRSLoraConfig(
-            r=model_args.rank[0],
+            init_r=model_args.rank[0], # 12
+            target_r=8,
+            tinit=200, # TODO: 预热比和adalora原文保持一致，需要根据task手动配置预热比
+            tfinal=800,
             lora_alpha=model_args.lora_alpha[0],
             target_modules=model_args.target_modules,
             lora_dropout=model_args.lora_dropout,
@@ -587,7 +597,11 @@ def main():
         print("*** AdaLoRA !!! ***")
         #TODO: need check some Param
         peft_config = AdaLoraConfig(
-            r=model_args.rank[0],
+            init_r=model_args.rank[0], # 12
+            target_r=8,
+            tinit=200,
+            tfinal=800,
+            deltaT=1,
             lora_alpha=model_args.lora_alpha[0],
             target_modules=model_args.target_modules,
             lora_dropout=model_args.lora_dropout,
@@ -596,16 +610,6 @@ def main():
         )
     elif 'base' in model_args.mode:
         print("*** Just Lora !!! ***")
-        peft_config = LoraConfig(
-            r=model_args.rank[0],
-            lora_alpha=model_args.lora_alpha[0],
-            target_modules=model_args.target_modules,
-            lora_dropout=model_args.lora_dropout,
-            bias=model_args.lora_bias,
-            task_type=model_args.lora_task_type,
-        )
-    elif 'sr' in model_args.mode:
-        print("*** SRLoRA !!! ***")
         peft_config = LoraConfig(
             r=model_args.rank[0],
             lora_alpha=model_args.lora_alpha[0],

@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import time
-def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, logger, calib_size, budget_rank, seed, num_batches=None):
+def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size, budget_rank, seed, data_args, softnorm, num_batches=None):
     """
     使用稳定秩校准每层的LoRA秩
 
@@ -12,13 +12,14 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, log
         model: 待校准的模型
         train_dataset: 训练数据集
         data_collator: 数据收集器
-        training_args: 训练参数
         logger: 日志器
         calib_size: 校准批次大小
         budget_rank: 总秩预算
     """
     logger.info("*** Calibrating LoRA ranks using Stable Rank ***")
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
     # 设置模型为训练模式
     model.train()
     original_training = model.training
@@ -56,7 +57,7 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, log
 
         # batch = next(iter(calib_dataloader))
         batch.pop('idx', None)  # 安全移除idx字段
-        batch = {k: v.to(training_args.device) if isinstance(v, torch.Tensor) else v
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
         # 前向 + 反向
@@ -83,8 +84,8 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, log
                 # 使用更高效的计算方式
                 with torch.no_grad():
                     # 计算Frobenius范数
-
                     fro_norm = torch.norm(G, p='fro')
+                    
                     # 使用SVD计算最大奇异值（谱范数）
                     try:
                         U, S, V = torch.svd_lowrank(G, q=1, niter=10)
@@ -145,12 +146,16 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, log
 
     # 计算每层的归一化分数
     composite_scores = np.array([metrics['composite_score'] for metrics in aggregated_metrics.values()])
-    softmax_scores = np.exp(composite_scores) / np.sum(np.exp(composite_scores))
+    
+    if softnorm:
+        normalized = np.exp(composite_scores) / np.sum(np.exp(composite_scores)) # softmax norm
+    else:
+        normalized = composite_scores / np.sum(composite_scores) # max-min norm
 
     # 分配LoRA秩
     allocated_ranks = {}
     for i, layer_name in enumerate(aggregated_metrics.keys()):
-        rank = int(round(softmax_scores[i] * budget_rank))  # 添加round()实现四舍五入
+        rank = int(round(normalized[i] * budget_rank))  # 添加round()实现四舍五入
         allocated_ranks[layer_name] = rank
 
     # 初始化lora_r_per_layer为一个包含空字典的列表
@@ -172,7 +177,7 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, training_args, log
 
     # 确保目录存在并保存文件
     os.makedirs("./rank_alloc", exist_ok=True)
-    with open(f"./rank_alloc/lora_rank_calibration_results_seed{seed}.json", "w") as f:
+    with open(f"./rank_alloc/lora_rank_calibration_results_seed_{seed}_task_{data_args.task_name}_softmax_{softnorm}.json", "w") as f:
         json.dump({layer_name: {**metrics, "rank": allocated_ranks.get(layer_name, 1)}
                    for layer_name, metrics in aggregated_metrics.items()}, f, indent=2)
 
