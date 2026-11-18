@@ -17,7 +17,7 @@ import re
 import warnings
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -116,7 +116,17 @@ class LoraConfig(PeftConfig):
             "help": "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer pattern is not in the common layers pattern."
         },
     )
-
+    # --- 新增字段：ERANK初始化lora秩字典 ---
+    lora_r_per_layer: Optional[List[Dict[str, int]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional list of dictionaries defining LoRA ranks per layer. "
+                "Example: [{'q_proj': 8, 'v_proj': 8}, ...]. If None, uses global [r](file:///root/autodl-fs/MSPLoRA/peft-0.5.0/src/peft/tuners/lora.py#L0-L0)."
+            )
+        },
+    )
+    # --- 新增结束 ---
     def __post_init__(self):
         self.peft_type = PeftType.LORA
 
@@ -327,9 +337,9 @@ class LoraModel(BaseTuner):
         **optionnal_kwargs,
     ):
         bias = hasattr(target, "bias") and target.bias is not None
-
+        # import pdb;pdb.set_trace()
         if lora_config.lora_r_per_layer is not None:
-            layer_idx = int(re.search(r'layer\.([^.]+)', optionnal_kwargs.pop("current_key")).group(1))
+            layer_idx = int(re.search(r'(?:layers?|encoder\.layer)\.(\d+)', optionnal_kwargs.get("current_key")).group(1))
             rank = lora_config.lora_r_per_layer[layer_idx][target_name]
         else:
             rank = lora_config.r

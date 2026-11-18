@@ -1,4 +1,5 @@
 import warnings
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -100,9 +101,12 @@ class DRSLoraLayer(LoraLayer):
 
     def reset_lora_parameters(self, adapter_name):
         if adapter_name in self.lora_A.keys():
-            nn.init.normal_(self.lora_E[adapter_name], mean=0.0, std=0.02)
-            nn.init.normal_(self.lora_A[adapter_name], mean=0.0, std=0.02)
-            nn.init.normal_(self.lora_B[adapter_name], mean=0.0, std=0.02)
+            # nn.init.normal_(self.lora_E[adapter_name], mean=0.0, std=0.02)
+            # nn.init.normal_(self.lora_A[adapter_name], mean=0.0, std=0.02)
+            # nn.init.normal_(self.lora_B[adapter_name], mean=0.0, std=0.02)
+            nn.init.constant_(self.lora_E[adapter_name], 1.0)
+            nn.init.kaiming_uniform_(self.lora_A[adapter_name], a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B[adapter_name])            
 
 
 class DRSLoraModel(LoraModel):
@@ -298,74 +302,29 @@ class DRSLoraModel(LoraModel):
     def forward(self, *args, **kwargs):
         outputs = self.model.forward(*args, **kwargs)
 
-        if getattr(outputs, "loss", None) is not None:
-            # Calculate the orthogonal regularization
-            orth_reg_weight = self.peft_config[self.trainable_adapter_name].orth_reg_weight
+        # bug 1, the same loss add with Trainer
+#         if getattr(outputs, "loss", None) is not None:
+#             # Calculate the orthogonal regularization
+#             orth_reg_weight = self.peft_config[self.trainable_adapter_name].orth_reg_weight
 
-            if orth_reg_weight <= 0:
-                raise ValueError("orth_reg_weight should be greater than 0. ")
+#             if orth_reg_weight <= 0:
+#                 raise ValueError("orth_reg_weight should be greater than 0. ")
 
-            regu_loss = 0
-            num_param = 0
-            for n, p in self.model.named_parameters():
-                if ("lora_A" in n or "lora_B" in n) and self.trainable_adapter_name in n:
-                    para_cov = p @ p.T if "lora_A" in n else p.T @ p
-                    I = torch.eye(*para_cov.size(), out=torch.empty_like(para_cov))
-                    I.requires_grad = False
-                    num_param += 1
-                    regu_loss += torch.norm(para_cov - I, p="fro")
-            if num_param > 0:
-                regu_loss = regu_loss / num_param
-            else:
-                regu_loss = 0
-            outputs.loss += orth_reg_weight * regu_loss
+#             regu_loss = 0
+#             num_param = 0
+#             for n, p in self.model.named_parameters():
+#                 if ("lora_A" in n or "lora_B" in n) and self.trainable_adapter_name in n:
+#                     para_cov = p @ p.T if "lora_A" in n else p.T @ p
+#                     I = torch.eye(*para_cov.size(), out=torch.empty_like(para_cov))
+#                     I.requires_grad = False
+#                     num_param += 1
+#                     regu_loss += torch.norm(para_cov - I, p="fro")
+#             if num_param > 0:
+#                 regu_loss = regu_loss / num_param
+#             else:
+#                 regu_loss = 0
+#             outputs.loss += orth_reg_weight * regu_loss
         return outputs
-
-    def resize_modules_by_rank_pattern(self, rank_pattern, adapter_name):
-        return rank_pattern
-        lora_config = self.peft_config[adapter_name]
-        # 创建新的rank_pattern字典来存储更新后的掩码
-        new_rank_pattern = {}
-        
-        for name, rank_idx in rank_pattern.items():
-            if isinstance(rank_idx, list):
-                rank = sum(rank_idx)
-            elif isinstance(rank_idx, torch.Tensor):
-                rank_idx = rank_idx.view(-1)
-                rank = rank_idx.sum().item()
-            else:
-                raise ValueError("Unexpected type of rank_idx")
-            
-            key = ".".join(name.split(".")[0:-2]) if adapter_name in name else ".".join(name.split(".")[0:-1])
-            _, target, _ = _get_submodules(self.model, key)
-            
-            # 提取权重
-            lora_E_weights = target.lora_E[adapter_name][rank_idx]
-            lora_A_weights = target.lora_A[adapter_name][rank_idx]
-            lora_B_weights = target.lora_B[adapter_name][:, rank_idx]
-            ranknum = target.ranknum[adapter_name]
-            
-            # 调整模块大小
-            target.update_layer(
-                adapter_name,
-                rank,
-                lora_config.lora_alpha,
-                lora_config.lora_dropout,
-                lora_config.init_lora_weights,
-            )
-            
-            with torch.no_grad():
-                if rank > 0:
-                    target.lora_E[adapter_name].copy_(lora_E_weights)
-                    target.lora_A[adapter_name].copy_(lora_A_weights)
-                    target.lora_B[adapter_name].copy_(lora_B_weights)
-                    target.ranknum[adapter_name].copy_(ranknum)
-            
-            # 创建新的rank_pattern匹配调整后的维度
-            # 全为True表示保留所有调整后的奇异值
-            new_rank_pattern[name] = [True] * rank
-        
-        return new_rank_pattern  # 返回更新后的rank_pattern
 
     def resize_state_dict_by_rank_pattern(self, rank_pattern, state_dict, adapter_name):
         return state_dict
@@ -394,9 +353,6 @@ class DRSLoraModel(LoraModel):
         # Finalize the budget allocation
         elif global_step == lora_config.total_step - lora_config.tfinal:
             _, rank_pattern = self.rankallocator.update_and_allocate(self.model, global_step, force_mask=True)
-            # for some reason, this freezes the trainable parameters and nothing gets updates
-            # new_rank_pattern = self.resize_modules_by_rank_pattern(rank_pattern, self.trainable_adapter_name)
-            # lora_config.rank_pattern = new_rank_pattern
             lora_config.rank_pattern = rank_pattern
         # Currently using inefficient way to mask the unimportant weights using the rank pattern
         #  due to problem mentioned above
@@ -733,13 +689,6 @@ class RankAllocator(object):
             budget = self.target_bgt
             process_ind = 2
         else:
-            # AdaLora code delete
-            # # Budget decreasing with a cubic scheduler
-            # mul_coeff = 1 - (step - tinit) / (total_step - tfinal - tinit)
-            # budget = int((self.init_bgt - self.target_bgt) * (mul_coeff**3) + self.target_bgt)
-            # process_ind = True if step % self.peft_config.deltaT == 0 else False
-
-            # DRSLora
             budget = self.target_bgt
             process_ind = 0 if step == total_step - tfinal else 1
         return budget, process_ind
@@ -808,7 +757,8 @@ class RankAllocator(object):
                     # Adalora delete
                     # p.masked_fill_(triplet_ipt[n] <= mask_threshold, 0.0)
                     # DRSLora
-                    mask = (p.data <= mask_threshold)
+                    # mask = (p.data <= mask_threshold) # bug 2
+                    mask = (p.data.abs() <= mask_threshold)
                     p.data.masked_fill_(mask, 0.0)
                     # dont backward
                     # rank_pattern[n] = (~(triplet_ipt[n] <= mask_threshold)).view(-1).tolist()
@@ -838,7 +788,7 @@ class RankAllocator(object):
         for n, p in model.named_parameters():
             if "lora_E" in n:
                 # clamp p to [0, a]
-                p.data = torch.clamp(p.data, min=0, max=a)
+                p.data = torch.clamp(p.data, min=-a, max=a)
                 # res grad info
                 # p.data = p.data.clamp(min=0, max=a)
 

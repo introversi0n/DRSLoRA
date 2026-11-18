@@ -101,6 +101,7 @@ def get_peft_model(model: PreTrainedModel, peft_config: PeftConfig, adapter_name
         model ([`transformers.PreTrainedModel`]): Model to be wrapped.
         peft_config ([`PeftConfig`]): Configuration object containing the parameters of the Peft model.
     """
+    # import pdb;pdb.set_trace()
     model_config = getattr(model, "config", {"model_type": "custom"})
     if hasattr(model_config, "to_dict"):
         model_config = model_config.to_dict()
