@@ -1,7 +1,7 @@
 #!/bin/bash
 export WANDB_MODE=offline
 export HF_ENDPOINT=https://hf-mirror.com
-export HF_HOME=~/autodl-tmp # autoDL
+export HF_HOME=~/autodl-fs/model_pkg # autoDL
 # export HF_HOME=./data # yours
 gpu=0
 
@@ -14,6 +14,7 @@ run(){
   rank=$2
   l_num=$3
   seed=$4
+  use_sr=$5
   is_train_in_stage=false
   lora_alpha="16"
   target_name='qv'
@@ -21,7 +22,10 @@ run(){
   lora_bias=none
   cutoff_len=256
   wandb_project=proejct_name
-  wandb_run_name=llama-msplora-${target_name}-${mode}-stage-${is_train_in_stage}-r-${rank}-n-${l_num}-alpha-16-seed-${seed}-bs-${bs}-lr-${learning_rate}-len-${cutoff_len}-epochs-${num_train_epochs}
+
+  lora_budget_rank=$((32 * 2 * rank))
+  
+  wandb_run_name=llama-msplora-${target_name}-${mode}-stage-${is_train_in_stage}-r-${rank}-n-${l_num}-sr-${use_sr}-budget-${lora_budget_rank}-alpha-16-seed-${seed}-bs-${bs}-lr-${learning_rate}-len-${cutoff_len}-epochs-${num_train_epochs}
   echo $wandb_run_name
   exp_dir=./llama-lora-${mode}/${wandb_run_name}
   mkdir -p $exp_dir
@@ -46,8 +50,11 @@ run(){
     --learning_rate=$learning_rate \
     --wandb_project=$wandb_project \
     --wandb_run_name=$wandb_run_name \
+    --use_sr_rank_allocation ${use_sr} \
+    --lora_budget_rank ${lora_budget_rank} \
+    --calib_batch_size ${bs} \
     --output_dir=${exp_dir}/model
-  
+    
   END_TIME=$(date +%s)
   ELAPSED_TIME=$((END_TIME - START_TIME))
   echo "===== ${mode} Train completed at: $(date) =====" >> "${exp_dir}/time.txt"
@@ -56,6 +63,30 @@ run(){
 
 seeds=(42)
 l_nums=(3)
+# # run LoRA, with rank 64, lnum1, seed 42, useERANK 1
+# run 'base' 64 1 42 0
+
+# # run LoRA, with rank 64, lnum1, seed 42, useERANK 1
+# run 'base' 48 1 42 0
+
+# # run LoRA, with rank 64, lnum1, seed 42, useERANK 1
+# run 'base' 32 1 42 0
+
+# # run LoRA, with rank 64, lnum1, seed 42, useERANK 1
+# run 'base' 16 1 42 0
+
+# run ERLoRA, with rank 64, lnum1, seed 42, useERANK 0
+run 'base' 64 1 42 1
+
+# run ERLoRA, with rank 64, lnum1, seed 42, useERANK 0
+#run 'base' 48 1 42 1
+
+# run ERLoRA, with rank 64, lnum1, seed 42, useERANK 0
+#run 'base' 32 1 42 1
+
+# run ERLoRA, with rank 64, lnum1, seed 42, useERANK 0
+#run 'base' 16 1 42 1
+
 
 # run LoRA with rank 64, seed 42
 # run 'base' 64 1 42
@@ -67,4 +98,4 @@ l_nums=(3)
 # run 'ada' 96 1 41
 
 # run MSPLoRA with rank 64, lora_num 3, seed 42
-run 'msplora' 64 3 41
+# run 'msplora' 64 3 41
