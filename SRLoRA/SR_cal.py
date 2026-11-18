@@ -1,9 +1,128 @@
 # 在文件开头添加导入
+import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import time
+def linear_func(composite_scores, mode='log', min_rank=1, max_rank=None):
+    """
+    根据复合分数分配LoRA秩，满足优先级和总秩约束
+    
+    Args:
+        composite_scores: 各层的复合分数（优先级指标），数值越大优先级越高
+        budget_rank: 总秩预算，默认为192
+        mode: 分配模式，'log'（对数函数）或'linear'（线性函数）
+        min_rank: 最小分配的秩，默认为1
+        max_rank: 最大分配的秩，如为None则自动计算
+    
+    Returns:
+        allocated_ranks: 各层分配的秩字典，键为层名，值为分配的秩
+    """
+    budget_rank=192
+    n_layers = len(composite_scores) # 24
+    
+    # 1. 按复合分数排序确定优先级（从高到低）
+    sorted_indices = np.argsort(composite_scores)[::-1]  # 降序排列
+    priority_order = list(range(1, n_layers + 1))  # 优先级编号，1为最高
+    
+    # 2. 生成基础分配曲线（对数或线性）
+    if mode == 'exp':
+        # 对数函数：r_i = a - b * ln(i)
+        # 确保i=1时ln(1)=0不会除零
+        x = np.arange(1, n_layers + 1)
+        # 基础对数曲线（递减）
+        base_curve = np.exp(n_layers + 1 - x)  # 使用n_layers+1-i避免ln(0)
+    else:  # linear
+        # 线性函数：r_i = a - b*(i-1)
+        x = np.arange(n_layers)-1
+        base_curve = n_layers - x -1 # 正比例函数递减
+
+        
+    # 3. 归一化基础曲线，使其和为1（表示分配比例）
+    base_curve_normalized = base_curve / np.sum(base_curve)
+    
+    # 4. 按优先级重新排列曲线（高优先级对应大的分配比例）
+    priority_curve = np.zeros(n_layers)
+    # cola_alloc = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8,  8,  8,  8,  8,  9,  9,  11, 18][::-1] # cola_softmax_41 
+    cola_alloc = [1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 7, 8, 9, 10, 11, 11, 13, 13, 14, 15, 23, 33][::-1] # mrpc_L1_42
+    allocated_ranks = {}
+    for i, orig_idx in enumerate(sorted_indices):
+        if orig_idx%2==0:
+            layer_name = f"roberta.encoder.layer.{int(orig_idx/2)}.attention.self.query.weight"  # 根据实际层名修改
+        else:
+            layer_name = f"roberta.encoder.layer.{int(orig_idx/2)}.attention.self.value.weight"  # 根据实际层名修改        
+        allocated_ranks[layer_name] = cola_alloc[i]
+    return allocated_ranks
+    
+    for i, orig_idx in enumerate(sorted_indices):
+        priority_curve[orig_idx] = base_curve_normalized[i]
+    
+    # 5. 计算初步分配的秩（保持优先级顺序）
+    initial_ranks = priority_curve * budget_rank
+    
+    # 6. 整数化处理（四舍五入后调整总和）
+    rounded_ranks = np.round(initial_ranks).astype(int)
+    
+    # 应用秩的上下限约束
+    if max_rank is not None:
+        rounded_ranks = np.clip(rounded_ranks, min_rank, max_rank)
+    else:
+        rounded_ranks = np.clip(rounded_ranks, min_rank, None)
+    
+    # 7. 调整总和至精确等于budget_rank
+    total_allocated = np.sum(rounded_ranks)
+    diff = budget_rank - total_allocated
+
+    if diff != 0:
+        # 按优先级调整：缺秩时优先给高优先级层加，多秩时优先从低优先级层减
+        if diff > 0:
+            # 需要增加秩，按优先级从高到低增加
+            adjustments = min(diff, n_layers)  # 每次调整最多n_layers个层
+            for i in range(adjustments):
+                layer_idx = sorted_indices[i % n_layers]  # 循环处理高优先级层
+                rounded_ranks[layer_idx] += 1
+                diff -= 1
+                if diff == 0:
+                    break
+        else:
+            # 需要减少秩，按优先级从低到高减少（保证不低于min_rank）
+            diff = abs(diff)
+            adjustments = min(diff, n_layers)
+            for i in range(adjustments):
+                layer_idx = sorted_indices[-(i % n_layers) - 1]  # 从最低优先级开始
+                if rounded_ranks[layer_idx] > min_rank:
+                    rounded_ranks[layer_idx] -= 1
+                    diff -= 1
+                    if diff == 0:
+                        break
+    
+    # 8. 最终验证
+    total_allocated = np.sum(rounded_ranks)
+    assert total_allocated == budget_rank, f"秩分配错误：总和{total_allocated} != 预算{budget_rank}"
+    
+    # 转换为层名到秩的字典（这里假设composite_scores的索引对应层名）
+    allocated_ranks = {}
+    for i, rank in enumerate(rounded_ranks):
+        layer_name = f"layer_{i}"  # 根据实际层名修改
+        allocated_ranks[layer_name] = rank
+    
+    return allocated_ranks
+
+def SVD_fig_print(S, file_path_name ,batch_i, layer_name):
+    import os
+    # 创建保存目录
+    os.makedirs(file_path_name, exist_ok=True)    
+    plt.hist(S.cpu().numpy(), bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Singular Values')
+    plt.ylabel('Frequency')
+    plt.title(f'Batch {batch_i} - {layer_name} Singular Values Distribution')
+    filename = f"batch_{batch_i}_{layer_name}_sv_dist.png"
+    filepath = os.path.join(file_path_name, filename)  # 保存到子文件夹
+    plt.savefig(filepath, dpi=300, bbox_inches='tight')
+    plt.close()  # 关闭图形释放内存    
+
+
 def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size, budget_rank, seed, data_args, softnorm, num_batches=None):
     """
     使用稳定秩校准每层的LoRA秩
@@ -69,6 +188,33 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
 
         # 收集当前批次的稳定秩和Frobenius范数
         batch_layer_metrics = {}
+        max_fro = 0.0
+        for name, param in model.named_parameters():
+            # 条件1：必须是权重矩阵（排除bias/LayerNorm）
+            # 条件2：是2D矩阵
+            # 条件3：是query或value投影层（根据模型结构，只有这些层有LoRA）
+            if (param.grad is not None and
+                    'weight' in name and
+                    param.grad.dim() == 2 and
+                    ('attention.self.query.weight' in name or
+                     'attention.self.value.weight' in name)):
+
+                G = param.grad.data     
+                # 使用更高效的计算方式
+                with torch.no_grad():
+                    # 计算Frobenius范数
+                    fro_norm = torch.norm(G, p='fro')
+                    
+                    # 使用SVD计算最大奇异值（谱范数）
+                    try:
+                        U, S, V = torch.svd_lowrank(G, q=1, niter=10)
+                        spec_norm = S[0]
+                    except:
+                        # 备用方法：直接计算矩阵范数
+                        spec_norm = torch.norm(G, p=2)
+
+                max_fro = max(fro_norm.item(), max_fro)
+                
         for name, param in model.named_parameters():
             # 条件1：必须是权重矩阵（排除bias/LayerNorm）
             # 条件2：是2D矩阵
@@ -89,6 +235,7 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
                     # 使用SVD计算最大奇异值（谱范数）
                     try:
                         U, S, V = torch.svd_lowrank(G, q=1, niter=10)
+                        # _, S_all, _ = torch.svd_lowrank(G, q=min(G.shape[0], G.shape[1]), niter=10)
                         spec_norm = S[0]
                     except:
                         # 备用方法：直接计算矩阵范数
@@ -99,6 +246,16 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
 
                     # 构建复合分数：稳定秩 × Frobenius范数
                     composite_score = sr.item() * fro_norm.item()
+
+
+                    # # 奇异值分布信息收集
+                    # SVD_fig_print(S,'svd_fig',i,name)
+                    
+                    # 11.27 修改了构建复合分数：稳定秩 × Frobenius范数（归一化到1以内后的）
+                    composite_score = sr.item() * ( fro_norm.item()/max_fro )
+                    
+                    # # 不构建复合分数，直接使用稳定秩
+                    # composite_score = sr.item()
 
                 batch_layer_metrics[name] = {
                     'spec_norm': spec_norm.item(),
@@ -150,7 +307,7 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
     if softnorm:
         normalized = np.exp(composite_scores) / np.sum(np.exp(composite_scores)) # softmax norm
     else:
-        normalized = composite_scores / np.sum(composite_scores) # max-min norm
+        normalized = composite_scores / np.sum(composite_scores) # L1 norm
 
     # 分配LoRA秩
     allocated_ranks = {}
@@ -158,6 +315,9 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
         rank = int(round(normalized[i] * budget_rank))  # 添加round()实现四舍五入
         allocated_ranks[layer_name] = rank
 
+    # # 根据分数排序计算秩分配结果，解除注释则覆盖掉上面原有的计算逻辑
+    # allocated_ranks = linear_func(composite_scores)
+    
     # 初始化lora_r_per_layer为一个包含空字典的列表
     num_layers = int(len(allocated_ranks)/2) # 这里所有的q、v层数除2即layer层数
     lora_r_per_layer = [{"query": 8, "value": 8} for _ in range(num_layers)]  # 使用默认值8初始化
@@ -177,7 +337,7 @@ def calibrate_lora_ranks(model, train_dataset, data_collator, logger, calib_size
 
     # 确保目录存在并保存文件
     os.makedirs("./rank_alloc", exist_ok=True)
-    with open(f"./rank_alloc/lora_rank_calibration_results_seed_{seed}_task_{data_args.task_name}_softmax_{softnorm}.json", "w") as f:
+    with open(f"./rank_alloc/lora_rank_calibration_results_seed_{seed}_task_{data_args.task_name}_softmax_{softnorm}_Fronorm.json", "w") as f: # 11.27增加了FroNorm
         json.dump({layer_name: {**metrics, "rank": allocated_ranks.get(layer_name, 1)}
                    for layer_name, metrics in aggregated_metrics.items()}, f, indent=2)
 
