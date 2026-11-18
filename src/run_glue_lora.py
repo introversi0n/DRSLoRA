@@ -62,6 +62,8 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 # SRLoRA
 from SRLoRA.SR_cal import calibrate_lora_ranks
+from SRLoRA.SR_cal_Entropy import calibrate_lora_ranks_Entropy
+from SRLoRA.SR_cal_sum import calibrate_lora_ranks_sum
 
 # AdaLoRA and DRSLoRA
 from Trainers import AdaTrainer, DRSTrainer
@@ -273,7 +275,19 @@ class ModelArguments:
         default=64,
         metadata={"help": "Batch size for calibration"},# 稳定秩校准用batchsize大小
     )
-
+    orth_reg_weight: Optional[float] = field(
+        default=0.5,
+        metadata={"help": "正交正则项权重，DRS/AdaLoRA专用"},
+    )
+    drs_tinit: Optional[int] = field(
+        default=1280,
+        metadata={"help": "DRSLoRA初始预热步数，此阶段不剪枝"},
+    )
+    drs_tfinal: Optional[int] = field(
+        default=5600,
+        metadata={"help": "DRSLoRA终态训练步数，训练最后tfinal步固定秩不剪枝"},
+    )
+    
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -371,7 +385,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 use_auth_token=True if model_args.use_auth_token else None,
             )
-
+            
     # Labels
     if data_args.task_name is not None:
         is_regression = data_args.task_name == "stsb"
@@ -547,7 +561,8 @@ def main():
     # ========== 插入校准代码 ==========
     lora_r_per_layer = None
     if model_args.use_sr_rank_allocation:
-        lora_r_per_layer = calibrate_lora_ranks(
+        # lora_r_per_layer = calibrate_lora_ranks_sum(
+        lora_r_per_layer = calibrate_lora_ranks_Entropy( # SRLoRA_Entropy_batch
             model=model,
             train_dataset=train_dataset,
             data_collator=data_collator,
@@ -559,7 +574,6 @@ def main():
             softnorm = model_args.softnorm,
             # num_batches=10 # if dont set, default iterator total dataset
         )
-
     # 校准完成后立即释放 model_noLoRA 的显存
     torch.cuda.empty_cache()  # 清理GPU缓存
     # return
@@ -581,12 +595,12 @@ def main():
         )
     elif 'drs' in model_args.mode:
         print("*** DRSLoRA !!! ***")
-        #TODO: need check some Param
         peft_config = DRSLoraConfig(
-            init_r=model_args.rank[0], # 12
-            target_r=8,
-            tinit=200, # TODO: 预热比和adalora原文保持一致，需要根据task手动配置预热比
-            tfinal=800,
+            init_r=int(model_args.rank[0] * 1.5),
+            target_r=model_args.rank[0],
+            tinit=model_args.drs_tinit,
+            tfinal=model_args.drs_tfinal,
+            orth_reg_weight=model_args.orth_reg_weight,
             lora_alpha=model_args.lora_alpha[0],
             target_modules=model_args.target_modules,
             lora_dropout=model_args.lora_dropout,
@@ -609,7 +623,10 @@ def main():
             task_type=model_args.lora_task_type,
         )
     elif 'base' in model_args.mode:
-        print("*** Just Lora !!! ***")
+        if model_args.use_sr_rank_allocation:
+            print("*** Just Lora !!! ***")
+        else:
+            print("*** Just ErankLora !!! ***")
         peft_config = LoraConfig(
             r=model_args.rank[0],
             lora_alpha=model_args.lora_alpha[0],

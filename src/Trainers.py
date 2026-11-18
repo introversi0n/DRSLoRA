@@ -464,12 +464,14 @@ class AdaTrainer(Trainer):
                         if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
 
-
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control) # move to this
-                    model.zero_grad()
+                    # bug 5:调整 global_step 更新顺序，修复步数偏移
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    # self.control = self.callback_handler.on_step_end(args, self.state, self.control) # note this
+                    
+                    self.control = self.callback_handler.on_step_end(args, self.state, self.control) # move to this
+                    model.zero_grad()
+                    # self.state.global_step += 1
+                    # self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
 
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
@@ -578,23 +580,34 @@ class DRSTrainer(AdaTrainer):
         # 安全计算正则项
         regu_loss = self.compute_svd_orth_regu(model)
 
-        # 加权求和（确保类型和设备一致）
+        # RL:正则项加权求和
         loss = loss + self.model.peft_config['default'].orth_reg_weight * regu_loss.to(loss.device)
 
 
-        # mrpc 3450 600 1800 => [600, 1650]
-        # stsb 4500 800 2000 => [800, 2500] now
-        # rte 3900 600 1800 => [600, 2100]
-        # cola 6700 800 3500 => [800, 3200]
-        # sst2 50520 6000 22000 => [6000, 28520]
+        # mrpc 3450 600 1800 => [600, 1650] (1
+        # stsb 4500 800 2000 => [800, 2500] (10
+        # rte 3900 600 1800 => [600, 2100] (1
+        # cola 6700 800 3500 => [800, 3200] (10
+               # 10720 1200 5000 => [1200, 5720]
+        # sst2 50520 6000 22000 => [6000, 28520] (100
         # llama 1164 200 600 => [200, 564]
-        #TODO: hard code, need add param or mul a rate
-        if self.state.global_step >= 200 and self.state.global_step < 564:
+        # TODO: hard code, need add param or mul a rate
+        # TODO: 预热比和adalora原文保持一致，需要根据task手动配置预热比
+        
+        # 替换原有的 if self.state.global_step >= 1200 and self.state.global_step < 5720:
+        peft_config = self.model.peft_config['default']
+        # 防御性校验，避免空值导致区间计算错误
+        assert peft_config.total_step is not None, "请先在DRSLoraConfig中配置total_step为总训练步数"
+        start_step = peft_config.tinit
+        end_step = peft_config.total_step - peft_config.tfinal
+
+        if self.state.global_step >= start_step and self.state.global_step < end_step:
             #middle add polar_loss
             # print("!!!!!!!!!!!")
-            RS_loss = self.compute_polar_RS(model, 0)
+            RS_loss = self.compute_polar_RS(model, 0) # RS
             Lnorm_loss = self.compute_polar_Lnorm(model, 2) # L2
             loss = loss + Lnorm_loss + 0.0001*RS_loss
+            # loss = loss + Lnorm_loss + 0.0001*RS_loss # 暂时注释观察损失项干扰
 
         return (loss, outputs) if return_outputs else loss
 

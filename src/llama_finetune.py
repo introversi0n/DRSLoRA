@@ -1,8 +1,9 @@
+import logging
 import os
 import sys
 import json
 from typing import List
-
+import copy
 import fire
 import torch
 import transformers
@@ -31,8 +32,17 @@ from transformers import LlamaForCausalLM, LlamaTokenizer, set_seed, TrainerCall
 
 from utils.prompter import Prompter
 
+# SRLoRA
+from SRLoRA.SR_cal import calibrate_lora_ranks
+from SRLoRA.SR_cal_Entropy import calibrate_lora_ranks_Entropy
+from SRLoRA.SR_cal_Entropy_llama import calibrate_lora_ranks_Entropy_llama
+from SRLoRA.SR_cal_sum import calibrate_lora_ranks_sum
+
+# DRSLoRA and AdaLoRA
 from Trainers import AdaTrainer, DRSTrainer
 from Callbacks import AdaLoRACallback, DRSLoRACallback
+
+logger = logging.getLogger(__name__)
 
 class LoRAFreezeCallback(TrainerCallback):
     def __init__(self, model, adapter_name, num_epoches, l_num, scale=None):
@@ -119,6 +129,9 @@ def train(
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    use_sr_rank_allocation: bool = False, # SRLoRA, if True will provide RankAllocate for base(Lora)
+    lora_budget_rank:int = 192, # use for SRLoRA RankAllocate Target_budget
+    calib_batch_size:int = 32, # use for SRLoRA Rank Search Batchsize, same to normal Training set
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -182,12 +195,16 @@ def train(
         torch_dtype=torch.float16,
         device_map=device_map,
         use_safetensors=True,
-        use_auth_token="your_hf_token",
+        # NOTE: gated 模型（如 Llama）需要 Hugging Face Access Token，
+        # 获取地址：https://huggingface.co/settings/tokens
+        # 本文件已设置 skip-worktree，本地填入真实 token 后不会被提交
+        use_auth_token="YOUR_HF_TOKEN_HERE",
     )
 
     tokenizer = LlamaTokenizer.from_pretrained(
         base_model,
-        token="your_hf_token",
+        # NOTE: 同上，填入真实 token；或改用 os.environ.get("HF_TOKEN")
+        token="YOUR_HF_TOKEN_HERE",
     )
 
     tokenizer.pad_token_id = (
@@ -243,8 +260,57 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
+    data_path = "/root/autodl-fs/data-tmp/alpaca_data_cleaned.json"  # 替换为实际路径
+    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+        data = load_dataset("json", data_files=data_path)
+    else:
+        data = load_dataset(data_path)
+        
+    if val_set_size > 0:
+        train_val = data["train"].train_test_split(
+            test_size=val_set_size, shuffle=True, seed=42
+        )
+        train_data = (
+            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+        )
+        val_data = (
+            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+        )
+    else:
+        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
+        val_data = None
+        
     model = prepare_model_for_int8_training(model)
+    # for name, param in model.named_parameters():
+    #     print(name)
+    
+    # ========== 插入校准代码 ==========
+    lora_r_per_layer = None
+    # import pdb;pdb.set_trace()
+    if use_sr_rank_allocation:
+        # lora_r_per_layer = calibrate_lora_ranks(
+        lora_r_per_layer = calibrate_lora_ranks_Entropy_llama( # SRLoRA_Entropy_batch
+            model=model,
+            train_dataset=train_data,
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+            tokenizer=tokenizer,  # 必须加这一行！
+            logger=logger,
+            calib_size=1,
+            budget_rank=lora_budget_rank,
+            seed = seed,
+            data_args = None, # llama run shell dont have data_args, task name default alphca
+            softnorm = False,
+            num_batches=50, # if dont set, default iterator total dataset
+            model_type='llama'  # 只加这一行
+        )
 
+    # 校准完成后立即释放 model_noLoRA 的显存
+    torch.cuda.empty_cache()  # 清理GPU缓存
+    # return [commented out for efficiency measurement - was debug leftover]
+    # ======================================
+    
     if mode == "base":
         print(f"Using base, lora_r :{lora_r}")
         config = LoraConfig(
@@ -255,6 +321,7 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
         )
+        config.lora_r_per_layer=lora_r_per_layer
     elif mode == "ada":
         print(f"Using ada, lora_r :{lora_r}")
         config = AdaLoraConfig(
@@ -269,7 +336,6 @@ def train(
             task_type="CAUSAL_LM",
         )
     elif mode == "drs":
-        #TODO:need to add DRS param
         print(f"Using drs, lora_r :{lora_r}")
         config = DRSLoraConfig(
             init_r=lora_r, # 96
@@ -304,12 +370,6 @@ def train(
     model = get_peft_model(model, config)
     for name, param in model.named_parameters():
         print(name)
-    
-    data_path = "/root/autodl-tmp/alpaca_data_cleaned.json"  # 替换为实际路径
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        data = load_dataset("json", data_files=data_path)
-    else:
-        data = load_dataset(data_path)
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -332,21 +392,7 @@ def train(
             print(f"Checkpoint {checkpoint_name} not found")
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
-
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = None
-
+    
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
