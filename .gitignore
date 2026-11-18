@@ -11,3 +11,18 @@ __pycache__
 /wandb
 /FacebookAI
 .ipynb_*
+
+# training outputs / large artifacts
+/roberta_glue_reproduce_base/
+/roberta_glue_reproduce_drs/
+/roberta_glue_reproduce_msp/
+/llama-mem/
+/peft-0.5.0/mobilebert_glue_smoke/
+/svd_fig.zip
+/rank_alloc/
+/src/roberta_glue_reproduce_drs/
+
+# backups / scratch
+*.bak
+*.bak_*
+/test.py
